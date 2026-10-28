@@ -18,32 +18,7 @@
 name: C++
 
 on:
-  push:
-    paths:
-      - '.github/workflows/cpp.yml'
-      - 'ci/docker/**'
-      - 'ci/scripts/cpp_*'
-      - 'ci/scripts/install_azurite.sh'
-      - 'ci/scripts/install_gcs_testbench.sh'
-      - 'ci/scripts/install_minio.sh'
-      - 'ci/scripts/msys2_*'
-      - 'ci/scripts/util_*'
-      - 'cpp/**'
-      - 'docker-compose.yml'
-      - 'format/Flight.proto'
-  pull_request:
-    paths:
-      - '.github/workflows/cpp.yml'
-      - 'ci/docker/**'
-      - 'ci/scripts/cpp_*'
-      - 'ci/scripts/install_azurite.sh'
-      - 'ci/scripts/install_gcs_testbench.sh'
-      - 'ci/scripts/install_minio.sh'
-      - 'ci/scripts/msys2_*'
-      - 'ci/scripts/util_*'
-      - 'cpp/**'
-      - 'docker-compose.yml'
-      - 'format/Flight.proto'
+  workflow_dispatch:
 
 concurrency:
   group: ${{ github.repository }}-${{ github.head_ref || github.sha }}-${{ github.workflow }}

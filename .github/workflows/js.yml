@@ -18,18 +18,7 @@
 name: NodeJS
 
 on:
-  push:
-    paths:
-      - '.github/workflows/js.yml'
-      - 'ci/docker/*js.dockerfile'
-      - 'ci/scripts/js_*'
-      - 'js/**'
-  pull_request:
-    paths:
-      - '.github/workflows/js.yml'
-      - 'ci/docker/*js.dockerfile'
-      - 'ci/scripts/js_*'
-      - 'js/**'
+  workflow_dispatch:
 
 concurrency:
   group: ${{ github.repository }}-${{ github.head_ref || github.sha }}-${{ github.workflow }}

@@ -20,3 +20,7 @@ set(VCPKG_CRT_LINKAGE dynamic)
 set(VCPKG_LIBRARY_LINKAGE static)
 
 set(VCPKG_BUILD_TYPE release)
+
+# Let ports use a pkg-config from the environment: the msys2 packages vcpkg
+# would otherwise download are gone from the msys2 repositories.
+set(VCPKG_ENV_PASSTHROUGH_UNTRACKED PKG_CONFIG)

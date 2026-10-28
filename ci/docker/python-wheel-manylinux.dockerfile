@@ -16,13 +16,31 @@
 # under the License.
 
 ARG base
-FROM ${base}
+FROM ${base} AS vcpkg-base
 
 ARG arch
 ARG arch_short
 ARG manylinux
 
 ENV MANYLINUX_VERSION=${manylinux}
+
+# CentOS 7 (manylinux2014) mirrors are retired, point yum at vault.centos.org
+RUN if [ -f /etc/yum.repos.d/CentOS-Base.repo ]; then \
+      sed -i -e 's/^mirrorlist=/#mirrorlist=/' \
+             -e 's|^#\?baseurl=http://mirror.centos.org|baseurl=http://vault.centos.org|' \
+             /etc/yum.repos.d/*.repo; \
+      if [ "$(uname -m)" = "aarch64" ]; then \
+        sed -i -e 's|vault.centos.org/centos/|vault.centos.org/altarch/|' \
+               -e 's|vault.centos.org/\$contentdir/|vault.centos.org/altarch/|' \
+               -e 's|vault.centos.org/altarch/\$releasever/|vault.centos.org/altarch/7.9.2009/|' \
+               -e 's|vault.centos.org/altarch/7/|vault.centos.org/altarch/7.9.2009/|' \
+               /etc/yum.repos.d/*.repo; \
+      fi; \
+    fi
+# AlmaLinux 8 (manylinux_2_28) rotated its RPM signing key in 2024
+RUN if [ -f /etc/almalinux-release ]; then \
+      rpm --import https://repo.almalinux.org/almalinux/RPM-GPG-KEY-AlmaLinux; \
+    fi
 
 # Ensure dnf is installed, especially for the manylinux2014 base
 RUN yum install -y dnf
@@ -72,12 +90,19 @@ ENV CMAKE_BUILD_TYPE=${build_type} \
     VCPKG_DEFAULT_TRIPLET=${arch_short}-linux-static-${build_type} \
     VCPKG_FEATURE_FLAGS="manifests"
 COPY ci/vcpkg/vcpkg.json arrow/ci/vcpkg/
+
+FROM vcpkg-base
+# Restore the vcpkg ports from a pre-built binary cache when one is provided
+# (ci/vcpkg-bincache in the build context, see .github/workflows/python.yml)
+ARG vcpkg_binary_sources=""
 # cannot use the S3 feature here because while aws-sdk-cpp=1.9.160 contains
 # ssl related fixies as well as we can patch the vcpkg portfile to support
 # arm machines it hits ARROW-15141 where we would need to fall back to 1.8.186
 # but we cannot patch those portfiles since vcpkg-tool handles the checkout of
 # previous versions => use bundled S3 build
-RUN vcpkg install \
+RUN --mount=type=bind,source=ci/vcpkg-bincache,target=/vcpkg-bincache \
+    VCPKG_BINARY_SOURCES="${vcpkg_binary_sources}" \
+    vcpkg install \
         --clean-after-build \
         --x-install-root=${VCPKG_ROOT}/installed \
         --x-manifest-root=/arrow/ci/vcpkg \
@@ -96,5 +121,7 @@ RUN PYTHON_ROOT=$(find /opt/python -name cp${PYTHON_VERSION/./}-*) && \
 SHELL ["/bin/bash", "-i", "-c"]
 ENTRYPOINT ["/bin/bash", "-i", "-c"]
 
+ARG pip_index_url=https://pypi.org/simple
 COPY python/requirements-wheel-build.txt /arrow/python/
-RUN pip install -r /arrow/python/requirements-wheel-build.txt
+# the released manylinux wheels were generated with Cython 3.0.3
+RUN PIP_INDEX_URL=${pip_index_url} pip install -r /arrow/python/requirements-wheel-build.txt "cython==3.0.3"

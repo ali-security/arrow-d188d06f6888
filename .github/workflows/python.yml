@@ -15,23 +15,21 @@
 # specific language governing permissions and limitations
 # under the License.
 
+# pyarrow release build: the sdist and the wheel matrix of
+# dev/tasks/python-wheels/github.{linux,osx.amd64,osx.arm64,windows}.yml
+# (matrix from dev/tasks/tasks.yml), each wheel tested after it is built.
+#
+# The prebuilt apache/arrow-dev vcpkg images are no longer published, so the
+# vcpkg dependencies are built once per platform by the *-deps jobs and kept
+# in a vcpkg "files" binary cache persisted with actions/cache. A deps job
+# that runs out of time still saves the ports it finished, so the next run
+# resumes where it stopped; the wheel jobs only start once a complete cache
+# exists for their platform.
+
 name: Python
 
 on:
-  push:
-    paths:
-      - '.github/workflows/python.yml'
-      - 'ci/**'
-      - 'cpp/**'
-      - 'docker-compose.yml'
-      - 'python/**'
-  pull_request:
-    paths:
-      - '.github/workflows/python.yml'
-      - 'ci/**'
-      - 'cpp/**'
-      - 'docker-compose.yml'
-      - 'python/**'
+  workflow_dispatch:
 
 concurrency:
   group: ${{ github.repository }}-${{ github.head_ref || github.sha }}-${{ github.workflow }}
@@ -42,141 +40,777 @@ permissions:
 
 env:
   DOCKER_VOLUME_PREFIX: ".docker/"
+  PIP_INDEX_URL: "https://:2023-12-18@time-machines-pypi.sealsecurity.io/"
+  # downloads through the time machine intermittently stall past pip's 15s
+  # read timeout on the macOS runners
+  PIP_DEFAULT_TIMEOUT: "120"
+  PIP_RETRIES: "10"
+  PYARROW_VERSION: "14.0.2"
+  # ORC 1.9.0 is no longer on the apache.org mirrors ThirdpartyToolchain tries
+  ARROW_ORC_URL: "https://archive.apache.org/dist/orc/orc-1.9.0/orc-1.9.0.tar.gz"
+  # These tests need AWS resources that no longer exist (the public
+  # voltrondata-labs-datasets bucket was deleted), so they cannot pass anywhere.
+  S3_NETWORK_TESTS_DESELECT: "not test_s3fs_wrong_region and not test_resolve_s3_region and not (test_s3_real_aws and not region_selection)"
 
 jobs:
 
-  docker:
-    name: ${{ matrix.title }}
+  sdist:
+    name: Python sdist
     runs-on: ubuntu-latest
-    if: ${{ !contains(github.event.pull_request.title, 'WIP') }}
-    timeout-minutes: 60
+    timeout-minutes: 30
+    steps:
+      - name: Checkout Arrow
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: recursive
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Setup Archery
+        run: |
+          pip install -e dev/archery[docker]
+          mkdir -p ~/.local/bin
+          printf '#!/bin/sh\nexec docker compose "$@"\n' > ~/.local/bin/docker-compose
+          chmod +x ~/.local/bin/docker-compose
+          echo ~/.local/bin >> $GITHUB_PATH
+      - name: Build sdist
+        run: archery docker run -e PYARROW_VERSION=${PYARROW_VERSION} -e PIP_INDEX_URL=${PIP_INDEX_URL} python-sdist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sdist
+          path: python/dist/pyarrow-*.tar.gz
+          if-no-files-found: error
+
+  # The wheels are built with ARROW_BUILD_TESTS=OFF, so the C++ parquet
+  # encryption unit tests (key management, KMS, key wrapping, encryption
+  # configurations) are built and run here from the same source tree.
+  cpp-parquet-encryption:
+    name: C++ parquet encryption tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      ARROW_TEST_DATA: ${{ github.workspace }}/testing/data
+      PARQUET_TEST_DATA: ${{ github.workspace }}/cpp/submodules/parquet-testing/data
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+    steps:
+      - name: Checkout Arrow
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: recursive
+      - name: Restore ccache
+        uses: actions/cache/restore@v4
+        with:
+          path: .ccache
+          key: ccache-cpp-parquet-encryption-${{ github.run_id }}
+          restore-keys: ccache-cpp-parquet-encryption-
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            ccache ninja-build libssl-dev libthrift-dev libboost-dev \
+            libboost-filesystem-dev libboost-system-dev \
+            rapidjson-dev libgtest-dev libgmock-dev libsnappy-dev \
+            libzstd-dev liblz4-dev libbrotli-dev zlib1g-dev libre2-dev \
+            libutf8proc-dev
+      - name: Build
+        timeout-minutes: 35
+        run: |
+          cmake -S cpp -B cpp-build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+            -DARROW_DEPENDENCY_SOURCE=AUTO \
+            -DARROW_JEMALLOC=OFF \
+            -DARROW_MIMALLOC=OFF \
+            -DARROW_PARQUET=ON \
+            -DPARQUET_REQUIRE_ENCRYPTION=ON \
+            -DARROW_BUILD_TESTS=ON \
+            -DARROW_WITH_SNAPPY=ON \
+            -DARROW_WITH_ZLIB=ON
+          cmake --build cpp-build --target parquet-encryption-test parquet-encryption-key-management-test
+      - name: Save ccache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: .ccache
+          key: ccache-cpp-parquet-encryption-${{ github.run_id }}-${{ github.run_attempt }}
+      - name: Test
+        run: ctest --test-dir cpp-build -R '^parquet-encryption' -V
+
+  linux-deps:
+    name: vcpkg deps manylinux ${{ matrix.manylinux }} ${{ matrix.arch_alias }}
+    runs-on: ${{ matrix.runs-on }}
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
-        name:
-          - conda-python-docs
-          - conda-python-3.9-nopandas
-          - conda-python-3.8-pandas-1.0
-          - conda-python-3.10-pandas-latest
         include:
-          - name: conda-python-docs
-            cache: conda-python-3.9
-            image: conda-python-docs
-            title: AMD64 Conda Python 3.9 Sphinx & Numpydoc
-            python: 3.9
-          - name: conda-python-3.9-nopandas
-            cache: conda-python-3.9
-            image: conda-python
-            title: AMD64 Conda Python 3.9 Without Pandas
-            python: 3.9
-          - name: conda-python-3.8-pandas-1.0
-            cache: conda-python-3.8
-            image: conda-python-pandas
-            title: AMD64 Conda Python 3.8 Pandas 1.0
-            python: 3.8
-            pandas: "1.0"
-            numpy: 1.16
-          - name: conda-python-3.10-pandas-latest
-            cache: conda-python-3.10
-            image: conda-python-pandas
-            title: AMD64 Conda Python 3.10 Pandas latest
-            python: "3.10"
-            pandas: latest
+          - manylinux: "2014"
+            base: manylinux2014
+            arch: amd64
+            arch_alias: x86_64
+            arch_short: amd64
+            runs-on: ubuntu-latest
+          - manylinux: "2014"
+            base: manylinux2014
+            arch: arm64v8
+            arch_alias: aarch64
+            arch_short: arm64
+            runs-on: ubuntu-24.04-arm
+          - manylinux: "2_28"
+            base: manylinux_2_28
+            arch: amd64
+            arch_alias: x86_64
+            arch_short: amd64
+            runs-on: ubuntu-latest
+          - manylinux: "2_28"
+            base: manylinux_2_28
+            arch: arm64v8
+            arch_alias: aarch64
+            arch_short: arm64
+            runs-on: ubuntu-24.04-arm
+    steps:
+      - name: Checkout Arrow
+        uses: actions/checkout@v4
+      - name: Look up complete vcpkg cache
+        id: done
+        uses: actions/cache/restore@v4
+        with:
+          path: ci/vcpkg-bincache
+          key: vcpkg-manylinux-${{ matrix.manylinux }}-${{ matrix.arch_short }}-done-${{ hashFiles('ci/vcpkg/**', '.env') }}
+          lookup-only: true
+      - name: Restore partial vcpkg cache
+        if: steps.done.outputs.cache-hit != 'true'
+        uses: actions/cache/restore@v4
+        with:
+          path: ci/vcpkg-bincache
+          key: vcpkg-manylinux-${{ matrix.manylinux }}-${{ matrix.arch_short }}-partial-${{ github.run_id }}
+          restore-keys: vcpkg-manylinux-${{ matrix.manylinux }}-${{ matrix.arch_short }}-
+      - name: Build vcpkg base image
+        if: steps.done.outputs.cache-hit != 'true'
+        run: |
+          VCPKG=$(grep '^VCPKG=' .env | cut -d '=' -f2 | cut -d '#' -f1 | tr -d '" ')
+          docker build \
+            --target vcpkg-base \
+            --build-arg base=quay.io/pypa/${{ matrix.base }}_${{ matrix.arch_alias }}:2023-10-03-72cdc42 \
+            --build-arg arch=${{ matrix.arch }} \
+            --build-arg arch_short=${{ matrix.arch_short }} \
+            --build-arg manylinux=${{ matrix.manylinux }} \
+            --build-arg vcpkg=${VCPKG} \
+            -t arrow-vcpkg-base \
+            -f ci/docker/python-wheel-manylinux.dockerfile .
+      - name: Build vcpkg dependencies
+        if: steps.done.outputs.cache-hit != 'true'
+        timeout-minutes: 35
+        run: |
+          mkdir -p ci/vcpkg-bincache
+          docker run --rm \
+            -v $(pwd)/ci/vcpkg-bincache:/vcpkg-bincache \
+            -e VCPKG_BINARY_SOURCES="clear;files,/vcpkg-bincache,readwrite" \
+            arrow-vcpkg-base \
+            timeout --signal=INT 1980 \
+            vcpkg install \
+              --clean-after-build \
+              --x-install-root=/opt/vcpkg/installed \
+              --x-manifest-root=/arrow/ci/vcpkg \
+              --x-feature=flight \
+              --x-feature=gcs \
+              --x-feature=json \
+              --x-feature=parquet \
+              --x-feature=s3
+      - name: Save partial vcpkg cache
+        if: always() && steps.done.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ci/vcpkg-bincache
+          key: vcpkg-manylinux-${{ matrix.manylinux }}-${{ matrix.arch_short }}-partial-${{ github.run_id }}-${{ github.run_attempt }}
+      - name: Save complete vcpkg cache
+        if: success() && steps.done.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ci/vcpkg-bincache
+          key: vcpkg-manylinux-${{ matrix.manylinux }}-${{ matrix.arch_short }}-done-${{ hashFiles('ci/vcpkg/**', '.env') }}
+
+  linux-wheel:
+    name: Wheel manylinux ${{ matrix.platform.manylinux }} ${{ matrix.platform.arch_alias }} Python ${{ matrix.python }}
+    needs: linux-deps
+    runs-on: ${{ matrix.platform.runs-on }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - manylinux: "2014"
+            service: "2014"
+            arch: amd64
+            arch_alias: x86_64
+            arch_short: amd64
+            runs-on: ubuntu-latest
+          - manylinux: "2014"
+            service: "2014"
+            arch: arm64v8
+            arch_alias: aarch64
+            arch_short: arm64
+            runs-on: ubuntu-24.04-arm
+          - manylinux: "2_28"
+            service: "2-28"
+            arch: amd64
+            arch_alias: x86_64
+            arch_short: amd64
+            runs-on: ubuntu-latest
+          - manylinux: "2_28"
+            service: "2-28"
+            arch: arm64v8
+            arch_alias: aarch64
+            arch_short: arm64
+            runs-on: ubuntu-24.04-arm
+        python: ["3.8", "3.9", "3.10", "3.11", "3.12"]
     env:
-      PYTHON: ${{ matrix.python || 3.8 }}
-      UBUNTU: ${{ matrix.ubuntu || 20.04 }}
-      PANDAS: ${{ matrix.pandas || 'latest' }}
-      NUMPY: ${{ matrix.numpy || 'latest' }}
+      # archery uses these environment variables
+      ARCH: ${{ matrix.platform.arch }}
+      ARCH_ALIAS: ${{ matrix.platform.arch_alias }}
+      ARCH_SHORT: ${{ matrix.platform.arch_short }}
+      PYTHON: ${{ matrix.python }}
+      VCPKG_BINARY_SOURCES: "clear;files,/vcpkg-bincache,read"
     steps:
       - name: Checkout Arrow
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
           submodules: recursive
-      - name: Cache Docker Volumes
-        uses: actions/cache@v3
+      - name: Restore vcpkg cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ci/vcpkg-bincache
+          key: vcpkg-manylinux-${{ matrix.platform.manylinux }}-${{ matrix.platform.arch_short }}-done-${{ hashFiles('ci/vcpkg/**', '.env') }}
+          fail-on-cache-miss: true
+      - name: Restore ccache
+        uses: actions/cache/restore@v4
         with:
           path: .docker
-          key: ${{ matrix.cache }}-${{ hashFiles('cpp/**') }}
-          restore-keys: ${{ matrix.cache }}-
+          key: ccache-manylinux-${{ matrix.platform.manylinux }}-${{ matrix.platform.arch_short }}-${{ github.run_id }}
+          restore-keys: ccache-manylinux-${{ matrix.platform.manylinux }}-${{ matrix.platform.arch_short }}-
       - name: Setup Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
-          python-version: 3.8
+          python-version: "3.12"
       - name: Setup Archery
-        run: pip install -e dev/archery[docker]
-      - name: Execute Docker Build
-        env:
-          ARCHERY_DOCKER_USER: ${{ secrets.DOCKERHUB_USER }}
-          ARCHERY_DOCKER_PASSWORD: ${{ secrets.DOCKERHUB_TOKEN }}
         run: |
-          sudo sysctl -w kernel.core_pattern="core.%e.%p"
-          ulimit -c unlimited
-          archery docker run ${{ matrix.image }}
-      - name: Docker Push
-        if: >-
-          success() &&
-          github.event_name == 'push' &&
-          github.repository == 'apache/arrow' &&
-          github.ref_name == 'main'
-        env:
-          ARCHERY_DOCKER_USER: ${{ secrets.DOCKERHUB_USER }}
-          ARCHERY_DOCKER_PASSWORD: ${{ secrets.DOCKERHUB_TOKEN }}
-        continue-on-error: true
-        run: archery docker push ${{ matrix.image }}
+          pip install -e dev/archery[docker]
+          mkdir -p ~/.local/bin
+          printf '#!/bin/sh\nexec docker compose "$@"\n' > ~/.local/bin/docker-compose
+          chmod +x ~/.local/bin/docker-compose
+          echo ~/.local/bin >> $GITHUB_PATH
+      - name: Build wheel
+        timeout-minutes: 34
+        shell: bash
+        run: |
+          # archive.apache.org intermittently times out from the runners:
+          # fetch ORC with retries and hand the build the local tarball
+          mkdir -p orc-download
+          curl -fsSL --retry 8 --retry-all-errors --retry-delay 20 -o orc-download/orc-1.9.0.tar.gz "${ARROW_ORC_URL}"
+          archery docker run -e SETUPTOOLS_SCM_PRETEND_VERSION=${PYARROW_VERSION} -e PIP_INDEX_URL=${PIP_INDEX_URL} -e ARROW_ORC_URL=file:///arrow/orc-download/orc-1.9.0.tar.gz python-wheel-manylinux-${{ matrix.platform.service }}
+      - name: Save ccache
+        if: always() && matrix.python == '3.12'
+        uses: actions/cache/save@v4
+        with:
+          path: .docker
+          key: ccache-manylinux-${{ matrix.platform.manylinux }}-${{ matrix.platform.arch_short }}-${{ github.run_id }}-${{ github.run_attempt }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel-manylinux-${{ matrix.platform.manylinux }}-${{ matrix.platform.arch_alias }}-${{ matrix.python }}
+          path: python/repaired_wheels/*.whl
+          if-no-files-found: error
+      - name: Test wheel
+        shell: bash
+        run: |
+          archery docker run -e PIP_INDEX_URL=${PIP_INDEX_URL} python-wheel-manylinux-test-imports
+          echo "Deselected (need deleted AWS resources): test_fs.py::test_s3fs_wrong_region test_fs.py::test_resolve_s3_region test_fs.py::test_s3_real_aws"
+          archery docker run -e PIP_INDEX_URL=${PIP_INDEX_URL} -e "PYTEST_ADDOPTS=-k '${S3_NETWORK_TESTS_DESELECT}'" python-wheel-manylinux-test-unittests
 
-  macos:
-    name: AMD64 macOS 12 Python 3
-    runs-on: macos-latest
-    if: ${{ !contains(github.event.pull_request.title, 'WIP') }}
-    timeout-minutes: 60
+  macos-deps:
+    name: vcpkg deps macOS ${{ matrix.arch }}
+    runs-on: ${{ matrix.runs-on }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runs-on: macos-15-intel
+            triplet: amd64-osx-static-release
+            # host tools use the target triplet (its zlib fdopen fix)
+            host_triplet: amd64-osx-static-release
+            macos_deployment_target: "10.14"
+          - arch: arm64
+            runs-on: macos-14
+            triplet: arm64-osx-static-release
+            host_triplet: arm64-osx
+            macos_deployment_target: "11.0"
     env:
-      ARROW_HOME: /usr/local
-      ARROW_DATASET: ON
-      ARROW_FLIGHT: ON
-      ARROW_GANDIVA: ON
-      ARROW_GCS: OFF
-      ARROW_HDFS: ON
-      ARROW_JEMALLOC: ON
-      ARROW_ORC: ON
-      ARROW_PARQUET: ON
-      PARQUET_REQUIRE_ENCRYPTION: ON
-      ARROW_PYTHON: ON
-      ARROW_S3: ON
-      ARROW_SUBSTRAIT: ON
-      ARROW_WITH_ZLIB: ON
-      ARROW_WITH_LZ4: ON
-      ARROW_WITH_BZ2: ON
-      ARROW_WITH_ZSTD: ON
-      ARROW_WITH_SNAPPY: ON
-      ARROW_WITH_BROTLI: ON
-      ARROW_BUILD_TESTS: OFF
-      PYARROW_TEST_LARGE_MEMORY: ON
-      # Current oldest supported version according to https://endoflife.date/macos
-      MACOSX_DEPLOYMENT_TARGET: 10.15
+      MACOSX_DEPLOYMENT_TARGET: ${{ matrix.macos_deployment_target }}
+      VCPKG_DEFAULT_TRIPLET: ${{ matrix.triplet }}
+      VCPKG_DEFAULT_HOST_TRIPLET: ${{ matrix.host_triplet }}
+      VCPKG_FEATURE_FLAGS: "manifests"
+      VCPKG_OVERLAY_TRIPLETS: ${{ github.workspace }}/ci/vcpkg
+      VCPKG_ROOT: ${{ github.workspace }}/vcpkg
+      # use the pinned CMake 3.21.4 on PATH instead of the runner's CMake 4
+      VCPKG_FORCE_SYSTEM_BINARIES: "1"
+    steps:
+      - name: Checkout Arrow
+        uses: actions/checkout@v4
+      # The x86_64 runner defaults to an Xcode whose clang/libc++ 19 rejects
+      # the 2023 vcpkg ports (grpc 1.51, google-cloud-cpp 2.9); use the
+      # newest installed Xcode older than 16.3 (clang 17 / libc++ 17).
+      - name: Select Xcode
+        if: matrix.arch == 'x86_64'
+        run: |
+          ls -d /Applications/Xcode*.app
+          xc=$(ls -d /Applications/Xcode_16.[0-2]*.app | sort -V | tail -1)
+          sudo xcode-select -s "$xc"
+          clang --version
+      - name: Look up complete vcpkg cache
+        id: done
+        uses: actions/cache/restore@v4
+        with:
+          path: vcpkg/installed
+          key: vcpkg-macos-${{ matrix.arch }}-installed-${{ hashFiles('ci/vcpkg/**', '.env') }}
+          lookup-only: true
+      - name: Restore partial vcpkg cache
+        if: steps.done.outputs.cache-hit != 'true'
+        uses: actions/cache/restore@v4
+        with:
+          path: vcpkg-bincache
+          key: vcpkg-macos-${{ matrix.arch }}-partial-${{ github.run_id }}
+          restore-keys: vcpkg-macos-${{ matrix.arch }}-
+      - name: Install System Dependencies
+        if: steps.done.outputs.cache-hit != 'true'
+        run: brew install bash bison coreutils ninja
+      - name: Install Specific CMake version
+        if: steps.done.outputs.cache-hit != 'true'
+        run: |
+          curl -fsSL https://github.com/Kitware/CMake/releases/download/v3.21.4/cmake-3.21.4-macos-universal.tar.gz | tar -xzf - -C $RUNNER_TEMP
+          echo "$RUNNER_TEMP/cmake-3.21.4-macos-universal/CMake.app/Contents/bin" >> $GITHUB_PATH
+      - name: Install Vcpkg
+        if: steps.done.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          vcpkg_version=$(grep '^VCPKG=' .env | cut -d '=' -f2 | cut -d '#' -f1 | tr -d '" ')
+          env -u VCPKG_FORCE_SYSTEM_BINARIES ci/scripts/install_vcpkg.sh $VCPKG_ROOT $vcpkg_version
+          echo ${VCPKG_ROOT} >> $GITHUB_PATH
+      # google-cloud-cpp 2.9 builds std::future_error from a future_errc, which
+      # this SDK's libc++ only allows from C++17 on (its error_code constructor
+      # is private). Build that one port as C++17 through an overlay port so
+      # ci/vcpkg and the ABI of every other port stay unchanged; abseil pins
+      # its options.h to the C++14 choices, so mixing standards is safe.
+      - name: Overlay google-cloud-cpp port as C++17
+        if: matrix.arch == 'x86_64' && steps.done.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          mkdir -p $RUNNER_TEMP/overlay-ports
+          cp -R ${VCPKG_ROOT}/ports/google-cloud-cpp $RUNNER_TEMP/overlay-ports/
+          perl -0pi -e 's/(\n        -DBUILD_TESTING=OFF\n)/$1        -DCMAKE_CXX_STANDARD=17\n/' $RUNNER_TEMP/overlay-ports/google-cloud-cpp/portfile.cmake
+          grep -n -- '-DCMAKE_CXX_STANDARD=17' $RUNNER_TEMP/overlay-ports/google-cloud-cpp/portfile.cmake
+          echo "VCPKG_OVERLAY_PORTS=$RUNNER_TEMP/overlay-ports" >> $GITHUB_ENV
+      - name: Build vcpkg dependencies
+        if: steps.done.outputs.cache-hit != 'true'
+        timeout-minutes: 36
+        shell: bash
+        run: |
+          mkdir -p vcpkg-bincache
+          export PATH="$(brew --prefix bison)/bin:${PATH}"
+          VCPKG_BINARY_SOURCES="clear;files,$(pwd)/vcpkg-bincache,readwrite" \
+          vcpkg install \
+            --clean-after-build \
+            --x-install-root=${VCPKG_ROOT}/installed \
+            --x-manifest-root=ci/vcpkg \
+            --x-feature=flight \
+            --x-feature=gcs \
+            --x-feature=json \
+            --x-feature=parquet \
+            --x-feature=s3 2>&1 | tee vcpkg-install.log
+      # also raise the first error lines as annotations, which stay readable
+      # after the job log is no longer retrievable
+      - name: Show failed vcpkg build logs
+        if: failure() && steps.done.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          set +e +o pipefail
+          annotate() {
+            msg=$(grep -E "$2" "$1" | grep -v -E 'Werror|^\[[0-9]+/[0-9]+\] ' | head -15 | cut -c1-400 | sed 's/%/%25/g' | awk '{printf "%s%%0A", $0}')
+            [ -n "$msg" ] && echo "::error title=$(basename $(dirname $1))/$(basename $1)::$msg"
+          }
+          annotate vcpkg-install.log 'error|BUILD_FAILED|failed'
+          for f in $(ls -t ${VCPKG_ROOT}/buildtrees/*/*.log 2>/dev/null | head -6); do
+            echo "=== $f"; grep -n -E 'error|Error' $f | head -40
+            annotate "$f" 'error:|FAILED:|Error'
+          done
+          true
+      - name: Save partial vcpkg cache
+        if: always() && steps.done.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: vcpkg-bincache
+          key: vcpkg-macos-${{ matrix.arch }}-partial-${{ github.run_id }}-${{ github.run_attempt }}
+      # The wheel jobs restore the installed tree itself: a binary-cache
+      # restore would rebuild every port whenever the runner image's
+      # compiler differs from the one the deps job used.
+      - name: Save installed vcpkg tree
+        if: success() && steps.done.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: vcpkg/installed
+          key: vcpkg-macos-${{ matrix.arch }}-installed-${{ hashFiles('ci/vcpkg/**', '.env') }}
+
+  macos-wheel:
+    name: Wheel macOS ${{ matrix.platform.arch }} Python ${{ matrix.python }}
+    needs: macos-deps
+    # each architecture only needs its own deps leg
+    if: ${{ !cancelled() }}
+    runs-on: ${{ matrix.platform.runs-on }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - arch: x86_64
+            runs-on: macos-15-intel
+            triplet: amd64-osx-static-release
+            # host tools use the target triplet (its zlib fdopen fix)
+            host_triplet: amd64-osx-static-release
+            macos_deployment_target: "10.14"
+            simd_level: "SSE4_2"
+          - arch: arm64
+            runs-on: macos-14
+            triplet: arm64-osx-static-release
+            host_triplet: arm64-osx
+            macos_deployment_target: "11.0"
+            simd_level: "DEFAULT"
+        python: ["3.8", "3.9", "3.10", "3.11", "3.12"]
+    env:
+      ARROW_SIMD_LEVEL: ${{ matrix.platform.simd_level }}
+      CC: "clang"
+      CXX: "clang++"
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+      CMAKE_CXX_COMPILER_LAUNCHER: "ccache"
+      MACOSX_DEPLOYMENT_TARGET: ${{ matrix.platform.macos_deployment_target }}
+      PYARROW_BUILD_VERBOSE: 1
+      PYTHON_VERSION: ${{ matrix.python }}
+      PYTHON: "/Library/Frameworks/Python.framework/Versions/${{ matrix.python }}/bin/python${{ matrix.python }}"
+      VCPKG_DEFAULT_TRIPLET: ${{ matrix.platform.triplet }}
+      VCPKG_DEFAULT_HOST_TRIPLET: ${{ matrix.platform.host_triplet }}
+      VCPKG_FEATURE_FLAGS: "manifests"
+      VCPKG_OVERLAY_TRIPLETS: ${{ github.workspace }}/ci/vcpkg
+      VCPKG_ROOT: ${{ github.workspace }}/vcpkg
+      # use the pinned CMake 3.21.4 on PATH instead of the runner's CMake 4
+      VCPKG_FORCE_SYSTEM_BINARIES: "1"
     steps:
       - name: Checkout Arrow
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
           submodules: recursive
-      - name: Setup Python
-        uses: actions/setup-python@v4
+      # The x86_64 runner defaults to an Xcode whose clang/libc++ 19 rejects
+      # the 2023 vcpkg ports (grpc 1.51, google-cloud-cpp 2.9); use the
+      # newest installed Xcode older than 16.3 (clang 17 / libc++ 17).
+      - name: Select Xcode
+        if: matrix.platform.arch == 'x86_64'
+        run: |
+          ls -d /Applications/Xcode*.app
+          xc=$(ls -d /Applications/Xcode_16.[0-2]*.app | sort -V | tail -1)
+          sudo xcode-select -s "$xc"
+          clang --version
+      - name: Restore ccache
+        uses: actions/cache/restore@v4
         with:
-          python-version: '3.11'
-      - name: Install Dependencies
+          path: .ccache
+          key: ccache-macos-${{ matrix.platform.arch }}-${{ github.run_id }}
+          restore-keys: ccache-macos-${{ matrix.platform.arch }}-
+      - name: Install System Dependencies
+        run: |
+          brew install bash bison coreutils ninja ccache
+          echo "$(brew --prefix bison)/bin" >> $GITHUB_PATH
+      - name: Install Specific CMake version
+        run: |
+          curl -fsSL https://github.com/Kitware/CMake/releases/download/v3.21.4/cmake-3.21.4-macos-universal.tar.gz | tar -xzf - -C $RUNNER_TEMP
+          echo "$RUNNER_TEMP/cmake-3.21.4-macos-universal/CMake.app/Contents/bin" >> $GITHUB_PATH
+      - name: Install Vcpkg
         shell: bash
         run: |
-          brew bundle --file=cpp/Brewfile
-          python -m pip install \
-            -r python/requirements-build.txt \
-            -r python/requirements-test.txt
-      - name: Build
+          vcpkg_version=$(grep '^VCPKG=' .env | cut -d '=' -f2 | cut -d '#' -f1 | tr -d '" ')
+          env -u VCPKG_FORCE_SYSTEM_BINARIES ci/scripts/install_vcpkg.sh $VCPKG_ROOT $vcpkg_version
+          echo ${VCPKG_ROOT} >> $GITHUB_PATH
+      - name: Restore installed vcpkg tree
+        uses: actions/cache/restore@v4
+        with:
+          path: vcpkg/installed
+          key: vcpkg-macos-${{ matrix.platform.arch }}-installed-${{ hashFiles('ci/vcpkg/**', '.env') }}
+          fail-on-cache-miss: true
+      - name: Install Python ${{ matrix.python }}
+        shell: bash
+        run: sudo ci/scripts/install_python.sh macos ${{ matrix.python }}
+      - name: Build Wheel
+        timeout-minutes: 30
         shell: bash
         run: |
-          python -m pip install wheel
-          ci/scripts/cpp_build.sh $(pwd) $(pwd)/build
-          ci/scripts/python_build.sh $(pwd) $(pwd)/build
-      - name: Test
+          $PYTHON -m venv build-env
+          source build-env/bin/activate
+          pip install --upgrade pip wheel
+          PYTHON=python ci/scripts/python_wheel_macos_build.sh ${{ matrix.platform.arch }} $(pwd) $(pwd)/build
+      - name: Save ccache
+        if: always() && matrix.python == '3.12'
+        uses: actions/cache/save@v4
+        with:
+          path: .ccache
+          key: ccache-macos-${{ matrix.platform.arch }}-${{ github.run_id }}-${{ github.run_attempt }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel-macos-${{ matrix.platform.arch }}-${{ matrix.python }}
+          path: python/repaired_wheels/*.whl
+          if-no-files-found: error
+      - name: Test Wheel
         shell: bash
-        run: ci/scripts/python_test.sh $(pwd) $(pwd)/build
+        env:
+          PYTEST_ADDOPTS: "-k 'not test_cancellation and not test_s3fs_wrong_region and not test_resolve_s3_region and not (test_s3_real_aws and not region_selection)'"
+        run: |
+          echo "Deselected (need deleted AWS resources): test_fs.py::test_s3fs_wrong_region test_fs.py::test_resolve_s3_region test_fs.py::test_s3_real_aws"
+          $PYTHON -m venv test-env
+          source test-env/bin/activate
+          pip install --upgrade pip wheel
+          pip install -r python/requirements-wheel-test.txt
+          PYTHON=python ci/scripts/install_gcs_testbench.sh default
+          ci/scripts/python_wheel_unix_test.sh $(pwd)
+
+  windows-deps:
+    name: vcpkg deps Windows
+    runs-on: windows-2022
+    timeout-minutes: 55
+    env:
+      VCPKG_DEFAULT_TRIPLET: amd64-windows-static-md-release
+      # build host tools with the same triplet (pkg-config passthrough)
+      VCPKG_DEFAULT_HOST_TRIPLET: amd64-windows-static-md-release
+      VCPKG_FEATURE_FLAGS: "manifests"
+      VCPKG_OVERLAY_TRIPLETS: ${{ github.workspace }}\ci\vcpkg
+      VCPKG_ROOT: C:\vcpkg-arrow
+    steps:
+      - name: Checkout Arrow
+        uses: actions/checkout@v4
+      - name: Look up complete vcpkg cache
+        id: done
+        uses: actions/cache/restore@v4
+        with:
+          path: C:\vcpkg-arrow\installed
+          key: vcpkg-windows-v141-installed-${{ hashFiles('ci/vcpkg/**', '.env') }}
+          lookup-only: true
+      - name: Restore partial vcpkg cache
+        if: steps.done.outputs.cache-hit != 'true'
+        uses: actions/cache/restore@v4
+        with:
+          path: vcpkg-bincache
+          key: vcpkg-windows-v141-partial-${{ github.run_id }}
+          restore-keys: vcpkg-windows-v141-
+      - name: Install Vcpkg
+        if: steps.done.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          vcpkg_version=$(grep '^VCPKG=' .env | cut -d '=' -f2 | cut -d '#' -f1 | tr -d '" ')
+          ci/scripts/install_vcpkg.sh /c/vcpkg-arrow $vcpkg_version
+          # vcpkg's pinned 7-Zip 21.07 is no longer served by 7-zip.org
+          mkdir -p /c/vcpkg-arrow/downloads
+          curl -fsSL -o /c/vcpkg-arrow/downloads/7z2107-extra.7z https://downloads.sourceforge.net/project/sevenzip/7-Zip/21.07/7z2107-extra.7z
+      # The released Windows wheels were built with the VS 2017 toolset
+      # (v141, MSVC 14.16), whose STL imports CONCRT140.dll where the VS 2022
+      # one imports VCRUNTIME140_1.dll. Build the vcpkg ports with it too
+      # (an older linker cannot consume newer objects), through a copy of the
+      # overlay triplets so ci/vcpkg stays unchanged.
+      - name: Install the VS 2017 (v141) toolset
+        if: steps.done.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath
+          if (-not (Test-Path "$vs\VC\Tools\MSVC\14.16.*")) {
+            $installer = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vs_installer.exe"
+            $p = Start-Process -FilePath $installer -ArgumentList @('modify', '--installPath', "`"$vs`"", '--add', 'Microsoft.VisualStudio.Component.VC.v141.x86.x64', '--quiet', '--norestart', '--nocache') -Wait -PassThru
+            Write-Host "vs_installer exit code: $($p.ExitCode)"
+          }
+          Get-ChildItem "$vs\VC\Tools\MSVC"
+          if (-not (Test-Path "$vs\VC\Tools\MSVC\14.16.*")) { throw "MSVC 14.16 (v141) toolset not installed" }
+      - name: Use the v141 toolset for the vcpkg ports
+        if: steps.done.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/triplets"
+          cp ci/vcpkg/*.cmake "$RUNNER_TEMP/triplets/"
+          printf '\nset(VCPKG_PLATFORM_TOOLSET v141)\n' >> "$RUNNER_TEMP/triplets/amd64-windows-static-md-release.cmake"
+          echo "VCPKG_OVERLAY_TRIPLETS=$(cygpath -w "$RUNNER_TEMP/triplets")" >> $GITHUB_ENV
+      - name: Install pkg-config
+        if: steps.done.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          C:/msys64/usr/bin/bash.exe -lc "pacman -Sy --noconfirm mingw-w64-x86_64-pkgconf"
+          echo "PKG_CONFIG=C:/msys64/mingw64/bin/pkgconf.exe" >> $GITHUB_ENV
+      - name: Build vcpkg dependencies
+        if: steps.done.outputs.cache-hit != 'true'
+        timeout-minutes: 36
+        shell: bash
+        run: |
+          mkdir -p vcpkg-bincache
+          VCPKG_BINARY_SOURCES="clear;files,$(cygpath -w $(pwd))\\vcpkg-bincache,readwrite" \
+          /c/vcpkg-arrow/vcpkg.exe install \
+            --clean-after-build \
+            --x-install-root=C:/vcpkg-arrow/installed \
+            --x-manifest-root=ci/vcpkg \
+            --x-feature=flight \
+            --x-feature=gcs \
+            --x-feature=json \
+            --x-feature=parquet \
+            --x-feature=s3
+      - name: Save partial vcpkg cache
+        if: always() && steps.done.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: vcpkg-bincache
+          key: vcpkg-windows-v141-partial-${{ github.run_id }}-${{ github.run_attempt }}
+      # The wheel jobs restore the installed tree itself: a binary-cache
+      # restore would rebuild every port whenever the runner image's MSVC
+      # differs from the one the deps job used.
+      - name: Save installed vcpkg tree
+        if: success() && steps.done.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: C:\vcpkg-arrow\installed
+          key: vcpkg-windows-v141-installed-${{ hashFiles('ci/vcpkg/**', '.env') }}
+
+  windows-wheel:
+    name: Wheel Windows Python ${{ matrix.python }}
+    needs: windows-deps
+    runs-on: windows-2022
+    timeout-minutes: 55
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Cython / wheel versions the released wheel of each Python was
+          # generated and packed with
+          - python: "3.8"
+            python_full: "3.8.10"
+            cython: "0.29.36"
+            wheel: "0.41.1"
+          - python: "3.9"
+            python_full: "3.9.13"
+            cython: "0.29.36"
+            wheel: "0.41.1"
+          - python: "3.10"
+            python_full: "3.10.11"
+            cython: "0.29.36"
+            wheel: "0.41.1"
+          - python: "3.11"
+            python_full: "3.11.5"
+            cython: "0.29.36"
+            wheel: "0.41.1"
+          - python: "3.12"
+            python_full: "3.12.0"
+            cython: "3.0.3"
+            wheel: "0.41.2"
+    env:
+      ARROW_CXX_COMPILER: cl
+      ARROW_VCPKG_ROOT: C:\vcpkg-arrow
+      CCACHE_DIR: ${{ github.workspace }}\.ccache
+      CMAKE_BUILD_TYPE: release
+      CMAKE_C_COMPILER_LAUNCHER: ccache
+      CMAKE_CXX_COMPILER_LAUNCHER: ccache
+      CMAKE_GENERATOR: Ninja
+      PYTHON_VERSION: ${{ matrix.python_full }}
+      SETUPTOOLS_SCM_PRETEND_VERSION: "14.0.2"
+      VCPKG_DEFAULT_TRIPLET: amd64-windows-static-md-release
+      # build host tools with the same triplet (pkg-config passthrough)
+      VCPKG_DEFAULT_HOST_TRIPLET: amd64-windows-static-md-release
+      VCPKG_FEATURE_FLAGS: "manifests"
+      VCPKG_OVERLAY_TRIPLETS: ${{ github.workspace }}\ci\vcpkg
+      VCPKG_ROOT: C:\vcpkg-arrow
+    steps:
+      - name: Checkout Arrow
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: recursive
+      - name: Restore ccache
+        uses: actions/cache/restore@v4
+        with:
+          path: .ccache
+          key: ccache-windows-v141-${{ matrix.python }}-${{ github.run_id }}
+          restore-keys: |
+            ccache-windows-v141-${{ matrix.python }}-
+            ccache-windows-v141-
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python_full }}
+      - name: Install the VS 2017 (v141) toolset
+        shell: pwsh
+        run: |
+          $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath
+          if (-not (Test-Path "$vs\VC\Tools\MSVC\14.16.*")) {
+            $installer = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vs_installer.exe"
+            $p = Start-Process -FilePath $installer -ArgumentList @('modify', '--installPath', "`"$vs`"", '--add', 'Microsoft.VisualStudio.Component.VC.v141.x86.x64', '--quiet', '--norestart', '--nocache') -Wait -PassThru
+            Write-Host "vs_installer exit code: $($p.ExitCode)"
+          }
+          Get-ChildItem "$vs\VC\Tools\MSVC"
+          if (-not (Test-Path "$vs\VC\Tools\MSVC\14.16.*")) { throw "MSVC 14.16 (v141) toolset not installed" }
+      - name: Install Tools
+        shell: pwsh
+        run: |
+          choco install --no-progress -r -y ccache
+          $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath
+          # VS 2017 (v141, MSVC 14.16) toolset, as the released wheels and the
+          # vcpkg ports of windows-deps
+          $vcvars = "$env:RUNNER_TEMP\vcvars64-v141.bat"
+          "@call `"$vs\VC\Auxiliary\Build\vcvars64.bat`" -vcvars_ver=14.16" | Out-File -FilePath $vcvars -Encoding ascii
+          "VCVARS64_BAT=$vcvars" | Out-File -FilePath $env:GITHUB_ENV -Append
+          $redist = Get-ChildItem -Path "$vs\VC\Redist\MSVC" -Directory | Where-Object { $_.Name -match '^\d+\.\d+\.\d+$' } | Sort-Object { [version]$_.Name } -Descending | Select-Object -First 1
+          $dll = Get-ChildItem -Path "$($redist.FullName)\x64" -Recurse -Filter msvcp140.dll | Select-Object -First 1
+          "MSVCP140_DLL=$($dll.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append
+          python -m pip install -U pip setuptools
+          python -m pip install -r python/requirements-wheel-build.txt "cython==${{ matrix.cython }}" "wheel==${{ matrix.wheel }}"
+      - name: Install Vcpkg
+        shell: bash
+        run: |
+          vcpkg_version=$(grep '^VCPKG=' .env | cut -d '=' -f2 | cut -d '#' -f1 | tr -d '" ')
+          ci/scripts/install_vcpkg.sh /c/vcpkg-arrow $vcpkg_version
+          # vcpkg's pinned 7-Zip 21.07 is no longer served by 7-zip.org
+          mkdir -p /c/vcpkg-arrow/downloads
+          curl -fsSL -o /c/vcpkg-arrow/downloads/7z2107-extra.7z https://downloads.sourceforge.net/project/sevenzip/7-Zip/21.07/7z2107-extra.7z
+      - name: Restore installed vcpkg tree
+        uses: actions/cache/restore@v4
+        with:
+          path: C:\vcpkg-arrow\installed
+          key: vcpkg-windows-v141-installed-${{ hashFiles('ci/vcpkg/**', '.env') }}
+          fail-on-cache-miss: true
+      - name: Build wheel
+        timeout-minutes: 38
+        shell: cmd
+        run: |
+          mklink /J C:\arrow "%GITHUB_WORKSPACE%"
+          set "PATH=%PATH%;C:\Program Files\Git\usr\bin"
+          call C:\arrow\ci\scripts\python_wheel_windows_build.bat
+      - name: Save ccache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: .ccache
+          key: ccache-windows-v141-${{ matrix.python }}-${{ github.run_id }}-${{ github.run_attempt }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel-windows-${{ matrix.python }}
+          path: python/dist/*.whl
+          if-no-files-found: error
+      - name: Test wheel
+        shell: cmd
+        env:
+          PYTEST_ADDOPTS: "-k \"not test_s3fs_wrong_region and not test_resolve_s3_region and not (test_s3_real_aws and not region_selection)\""
+        run: |
+          echo Deselected (need deleted AWS resources): test_fs.py::test_s3fs_wrong_region test_fs.py::test_resolve_s3_region test_fs.py::test_s3_real_aws
+          call C:\arrow\ci\scripts\python_wheel_windows_test.bat

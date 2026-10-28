@@ -18,24 +18,7 @@
 name: Java
 
 on:
-  push:
-    paths:
-      - '.github/workflows/java.yml'
-      - 'ci/docker/*java*'
-      - 'ci/scripts/java*.sh'
-      - 'ci/scripts/util_*.sh'
-      - 'docker-compose.yml'
-      - 'format/Flight.proto'
-      - 'java/**'
-  pull_request:
-    paths:
-      - '.github/workflows/java.yml'
-      - 'ci/docker/*java*'
-      - 'ci/scripts/java*.sh'
-      - 'ci/scripts/util_*.sh'
-      - 'docker-compose.yml'
-      - 'format/Flight.proto'
-      - 'java/**'
+  workflow_dispatch:
 
 concurrency:
   group: ${{ github.repository }}-${{ github.head_ref || github.sha }}-${{ github.workflow }}

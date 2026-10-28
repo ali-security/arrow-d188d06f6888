@@ -18,18 +18,7 @@
 name: Archery & Crossbow
 
 on:
-  push:
-    paths:
-      - '.github/workflows/archery.yml'
-      - 'dev/archery/**'
-      - 'dev/tasks/**'
-      - 'docker-compose.yml'
-  pull_request:
-    paths:
-      - '.github/workflows/archery.yml'
-      - 'dev/archery/**'
-      - 'dev/tasks/**'
-      - 'docker-compose.yml'
+  workflow_dispatch:
 
 env:
   ARCHERY_DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}

@@ -19,7 +19,8 @@
 
 echo "Building windows wheel..."
 
-call "C:\Program Files (x86)\Microsoft Visual Studio\2017\Community\VC\Auxiliary\Build\vcvars64.bat"
+if not defined VCVARS64_BAT set "VCVARS64_BAT=C:\Program Files (x86)\Microsoft Visual Studio\2017\Community\VC\Auxiliary\Build\vcvars64.bat"
+call "%VCVARS64_BAT%"
 
 echo "=== (%PYTHON_VERSION%) Clear output directories and leftovers ==="
 del /s /q C:\arrow-build
@@ -50,8 +51,10 @@ set ARROW_WITH_SNAPPY=ON
 set ARROW_WITH_ZLIB=ON
 set ARROW_WITH_ZSTD=ON
 set CMAKE_UNITY_BUILD=ON
-set CMAKE_GENERATOR=Visual Studio 15 2017 Win64
-set VCPKG_ROOT=C:\vcpkg
+if not defined CMAKE_GENERATOR set "CMAKE_GENERATOR=Visual Studio 15 2017 Win64"
+@rem vcvars64.bat of VS 2022 points VCPKG_ROOT at the vcpkg bundled with Visual Studio
+if defined ARROW_VCPKG_ROOT (set "VCPKG_ROOT=%ARROW_VCPKG_ROOT%") else (set VCPKG_ROOT=C:\vcpkg)
+if not defined ARROW_CXX_COMPILER set ARROW_CXX_COMPILER=clcache
 set VCPKG_FEATURE_FLAGS=-manifests
 set VCGPK_TARGET_TRIPLET=amd64-windows-static-md-%CMAKE_BUILD_TYPE%
 
@@ -88,7 +91,7 @@ cmake ^
     -DARROW_WITH_ZLIB=%ARROW_WITH_ZLIB% ^
     -DARROW_WITH_ZSTD=%ARROW_WITH_ZSTD% ^
     -DCMAKE_BUILD_TYPE=%CMAKE_BUILD_TYPE% ^
-    -DCMAKE_CXX_COMPILER=clcache ^
+    -DCMAKE_CXX_COMPILER=%ARROW_CXX_COMPILER% ^
     -DCMAKE_INSTALL_PREFIX=C:\arrow-dist ^
     -DCMAKE_UNITY_BUILD=%CMAKE_UNITY_BUILD% ^
     -DMSVC_LINK_VERBOSE=ON ^
@@ -121,6 +124,7 @@ set CMAKE_PREFIX_PATH=C:\arrow-dist
 
 pushd C:\arrow\python
 @REM bundle the msvc runtime
-cp "C:\Program Files (x86)\Microsoft Visual Studio\2017\Community\VC\Redist\MSVC\14.16.27012\x64\Microsoft.VC141.CRT\msvcp140.dll" pyarrow\
+if not defined MSVCP140_DLL set "MSVCP140_DLL=C:\Program Files (x86)\Microsoft Visual Studio\2017\Community\VC\Redist\MSVC\14.16.27012\x64\Microsoft.VC141.CRT\msvcp140.dll"
+cp "%MSVCP140_DLL%" pyarrow\
 python setup.py bdist_wheel || exit /B 1
 popd

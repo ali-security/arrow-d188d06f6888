@@ -18,28 +18,7 @@
 name: R
 
 on:
-  push:
-    paths:
-      - ".github/workflows/r.yml"
-      - "ci/scripts/r_*.sh"
-      - "ci/scripts/cpp_*.sh"
-      - "ci/scripts/PKGBUILD"
-      - "ci/etc/rprofile"
-      - "ci/docker/**"
-      - "cpp/**"
-      - 'docker-compose.yml'
-      - "r/**"
-  pull_request:
-    paths:
-      - ".github/workflows/r.yml"
-      - "ci/scripts/r_*.sh"
-      - "ci/scripts/cpp_*.sh"
-      - "ci/scripts/PKGBUILD"
-      - "ci/etc/rprofile"
-      - "ci/docker/**"
-      - "cpp/**"
-      - 'docker-compose.yml'
-      - "r/**"
+  workflow_dispatch:
 
 concurrency:
   group: ${{ github.repository }}-${{ github.head_ref || github.sha }}-${{ github.workflow }}

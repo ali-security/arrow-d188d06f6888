@@ -18,16 +18,7 @@
 name: Docs
 
 on:
-  pull_request:
-    paths:
-      - 'docs/**'
-      - '.github/workflows/docs_light.yml'
-      - 'ci/docker/conda.dockerfile'
-      - 'ci/docker/conda-cpp.dockerfile'
-      - 'ci/docker/conda-python.dockerfile'
-      - 'ci/scripts/cpp_build.sh'
-      - 'ci/scripts/python_build.sh'
-      - 'docker-compose.yml'
+  workflow_dispatch:
 
 permissions:
   contents: read

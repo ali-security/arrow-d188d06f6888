@@ -18,32 +18,7 @@
 name: C GLib & Ruby
 
 on:
-  push:
-    paths:
-      - '.github/workflows/ruby.yml'
-      - 'ci/docker/**'
-      - 'ci/scripts/c_glib_*'
-      - 'ci/scripts/cpp_*'
-      - 'ci/scripts/msys2_*'
-      - 'ci/scripts/ruby_*'
-      - 'ci/scripts/util_*'
-      - 'c_glib/**'
-      - 'cpp/**'
-      - 'docker-compose.yml'
-      - 'ruby/**'
-  pull_request:
-    paths:
-      - '.github/workflows/ruby.yml'
-      - 'ci/docker/**'
-      - 'ci/scripts/c_glib_*'
-      - 'ci/scripts/cpp_*'
-      - 'ci/scripts/msys2_*'
-      - 'ci/scripts/ruby_*'
-      - 'ci/scripts/util_*'
-      - 'c_glib/**'
-      - 'cpp/**'
-      - 'docker-compose.yml'
-      - 'ruby/**'
+  workflow_dispatch:
 
 concurrency:
   group: ${{ github.repository }}-${{ github.head_ref || github.sha }}-${{ github.workflow }}

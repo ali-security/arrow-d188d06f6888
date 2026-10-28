@@ -1037,6 +1037,8 @@ services:
         vcpkg: ${VCPKG}
         python: ${PYTHON}
         manylinux: 2014
+        vcpkg_binary_sources: ${VCPKG_BINARY_SOURCES:-}
+        pip_index_url: ${PIP_INDEX_URL:-https://pypi.org/simple}
       context: .
       dockerfile: ci/docker/python-wheel-manylinux.dockerfile
       cache_from:
@@ -1060,6 +1062,8 @@ services:
         vcpkg: ${VCPKG}
         python: ${PYTHON}
         manylinux: 2_28
+        vcpkg_binary_sources: ${VCPKG_BINARY_SOURCES:-}
+        pip_index_url: ${PIP_INDEX_URL:-https://pypi.org/simple}
       context: .
       dockerfile: ci/docker/python-wheel-manylinux.dockerfile
       cache_from:
@@ -1088,6 +1092,7 @@ services:
       args:
         arch: ${ARCH}
         python: ${PYTHON}
+        pip_index_url: ${PIP_INDEX_URL:-https://pypi.org/simple}
       context: .
       dockerfile: ci/docker/python-wheel-manylinux-test.dockerfile
       cache_from:

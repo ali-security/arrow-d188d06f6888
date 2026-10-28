@@ -18,24 +18,7 @@
 name: Java JNI
 
 on:
-  push:
-    paths:
-      - '.github/workflows/java_jni.yml'
-      - 'ci/docker/**'
-      - 'ci/scripts/cpp_build.sh'
-      - 'ci/scripts/java_*'
-      - 'cpp/**'
-      - 'docker-compose.yml'
-      - 'java/**'
-  pull_request:
-    paths:
-      - '.github/workflows/java_jni.yml'
-      - 'ci/docker/**'
-      - 'ci/scripts/cpp_build.sh'
-      - 'ci/scripts/java_*'
-      - 'cpp/**'
-      - 'docker-compose.yml'
-      - 'java/**'
+  workflow_dispatch:
 
 concurrency:
   group: ${{ github.repository }}-${{ github.head_ref || github.sha }}-${{ github.workflow }}

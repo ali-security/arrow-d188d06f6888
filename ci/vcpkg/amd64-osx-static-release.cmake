@@ -21,5 +21,9 @@ set(VCPKG_LIBRARY_LINKAGE static)
 
 set(VCPKG_CMAKE_SYSTEM_NAME Darwin)
 set(VCPKG_OSX_ARCHITECTURES x86_64)
+# zlib 1.2.13 defines fdopen() away on macOS, which breaks against the
+# macOS 15 SDK of the x86_64 runners; keep the SDK declaration
+set(VCPKG_C_FLAGS "-Dfdopen=fdopen")
+set(VCPKG_CXX_FLAGS "-Dfdopen=fdopen")
 
 set(VCPKG_BUILD_TYPE release)
